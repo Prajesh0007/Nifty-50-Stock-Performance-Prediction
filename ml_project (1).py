@@ -18,6 +18,7 @@ from scipy import stats as scipy_stats
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.ensemble import (
