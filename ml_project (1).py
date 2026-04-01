@@ -614,7 +614,7 @@ print(f"   Target balance: "
       f"{stocks_model['target'].value_counts(normalize=True).round(3).to_dict()}")
 
 # ============================================================
-# 4. CHRONOLOGICAL SPLIT WITH PURGE GAP 
+# 4. CHRONOLOGICAL SPLIT 
 # ============================================================
 show_section_progress(4, "Chronological Split With Purge")
 all_dates = sorted(stocks_model["date"].unique())
@@ -1004,7 +1004,7 @@ y_ev = ev_df["target"].astype(int).values
 print(f"\n✅ Scaling done | Train: {len(Xs_tr):,} | Val: {len(Xs_vl):,} | Test: {len(Xs_ev):,}")
 
 # ============================================================
-# 10B. LEAKAGE-SAFE TRAINING OVERRIDE
+# 8. LEAKAGE-SAFE TRAINING OVERRIDE
 # ============================================================
 show_section_progress(8, "Optimized Model Training")
 print("\n   Re-training with walk-forward tuning, internal calibration, and time-safe stacking ...")
@@ -1765,7 +1765,7 @@ print(f"\n   âœ… Final best global: {best_name}  Val-AUC={best_auc:.4f}")
 print(f"   Final ranking metric: Test-AUC={metrics_g.get(best_name, {}).get('test_auc', 0.5):.4f} "
       f"| selection_score={metrics_g.get(best_name, {}).get('selection_score', best_score):.4f}")
 # ============================================================
-# 11. CALIBRATION DIAGNOSTIC PLOTS 
+# 9. CALIBRATION DIAGNOSTIC PLOTS 
 # ============================================================
 show_section_progress(9, "Calibration And Evaluation")
 print("\n📊 Calibration & model evaluation plots ...")
@@ -1911,7 +1911,7 @@ for rid in sorted(regime_best.keys()):
                                  target_names=["Underperf","Outperf"], digits=3))
 
 # ============================================================
-# 12. WALK-FORWARD BACKTEST — proper benchmarks 
+# 10. WALK-FORWARD BACKTEST — proper benchmarks 
 # ============================================================
 show_section_progress(10, "Walk-Forward Backtest")
 print("\n🚀 Walk-Forward Backtest ...")
@@ -2285,7 +2285,7 @@ with open(experiment_path, "w", encoding="utf-8") as f:
 print(f"   Saved experiment artifact: {experiment_path}")
 
 # ============================================================
-# 13. BACKTEST PLOTS
+# 11. BACKTEST PLOTS
 # ============================================================
 show_section_progress(11, "Backtest Plots")
 print("\n📈 Generating backtest plots ...")
@@ -2457,7 +2457,7 @@ ax.set_title("Monthly Alpha vs NIFTY 50 (%)", fontsize=12, fontweight="bold")
 plt.tight_layout(); plt.show()
 
 # ============================================================
-# 14. SIGNAL GENERATION
+# 12. SIGNAL GENERATION
 # ============================================================
 print("\n🎯 Generating Trading Signals ...")
 
@@ -2628,7 +2628,7 @@ if len(sells) > 0:
               f"Mom8W={row['mom_8w']*100:.1f}%")
 
 # ============================================================
-# 15. MASTER DASHBOARD
+# 13. MASTER DASHBOARD
 # ============================================================
 print("\n🖥️  Master Dashboard ...")
 show_section_progress(13, "Master Dashboard")
@@ -2709,7 +2709,7 @@ plt.suptitle(
 plt.show()
 
 # ============================================================
-# 16. FINAL SUMMARY
+# 14. FINAL SUMMARY
 # ============================================================
 show_section_progress(14, "Final Summary")
 print("\n" + "="*78)
