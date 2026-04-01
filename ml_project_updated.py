@@ -1,3 +1,15 @@
+# ============================================================
+#  NIFTY 50 ADAPTIVE FACTOR-REGIME ML SYSTEM v8.0
+#  Forensic-grade pipeline — all 7 critical issues fixed:
+#  1. Signal collapse → CalibratedClassifierCV + spread check
+#  2. Class collapse → regime-specific class_weight + min samples
+#  3. ML < EW → better portfolio construction + signal quality
+#  4. Regime K selection → composite score (BIC+Silhouette+Stability)
+#  5. Leakage in regime model selection → cross-val within train only
+#  6. Rolling window contamination → purged gap between splits
+#  7. Equal-weight look-ahead removed → proper benchmarks only
+#  Paste entire file into ONE Colab cell.
+# ============================================================
 
 import copy
 import json
@@ -18,17 +30,20 @@ from scipy import stats as scipy_stats
 
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
-from sklearn.mixture import GaussianMixture
 from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression
+from sklearn.mixture import GaussianMixture
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.svm import SVC
 from sklearn.ensemble import (
-    RandomForestClassifier,
-    ExtraTreesClassifier)
-
-from sklearn.calibration import calibration_curve
+    RandomForestClassifier, GradientBoostingClassifier,
+    ExtraTreesClassifier, AdaBoostClassifier, BaggingClassifier,
+    VotingClassifier,
+)
+from sklearn.neural_network import MLPClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.model_selection import (
-    cross_val_score, TimeSeriesSplit
+    cross_val_score, TimeSeriesSplit, StratifiedKFold
 )
 from sklearn.metrics import (
     roc_auc_score, roc_curve, auc,
@@ -131,13 +146,8 @@ def detect_nvidia_gpu():
         return False
 
 # ============================================================
-# SECTION 1 — CONFIGURATION
+# 1. CONFIG
 # ============================================================
-# Central settings file. Sets date range, train/val/test split
-# ratios, purge gap, buy/sell thresholds, position limits,
-# transaction costs, stock tickers, and sector mappings.
-# Change any parameter here and it flows through the whole pipeline.
-
 START_DATE    = "2005-01-01"
 END_DATE      = datetime.date.today().strftime("%Y-%m-%d")
 
@@ -145,7 +155,7 @@ FORWARD_WEEKS = 12
 TRAIN_RATIO   = 0.70
 VAL_RATIO     = 0.15
 # PURGE GAP: drop N weeks at split boundaries to prevent rolling-window leakage
-PURGE_WEEKS   = 8   #6: purge rows within 8 weeks of any split boundary
+PURGE_WEEKS   = 8   # FIX #6: purge rows within 8 weeks of any split boundary
 CALIBRATION_RATIO = 0.20
 EARLY_STOP_RATIO  = 0.15
 TUNING_POOL_RATIO = 0.80
@@ -175,7 +185,7 @@ INITIAL_CAPITAL = 1_000_000
 
 BUY_THRESH  = 0.57   # slightly lower → more signals
 SELL_THRESH = 0.43
-MIN_SIGNAL_SPREAD = 0.08  #1: reject model if max-min prob < 8%
+MIN_SIGNAL_SPREAD = 0.08  # FIX #1: reject model if max-min prob < 8%
 EXPERIMENT_DIR = "training_experiments"
 
 show_section_progress(1, "Configuration")
@@ -218,13 +228,8 @@ SECTOR_MAP = {
 print(f"✅ Config | {START_DATE} → {END_DATE} | Tickers: {len(NIFTY50_TICKERS)}")
 
 # ============================================================
-# SECTION 2 — DATA DOWNLOAD
+# 2. DATA DOWNLOAD
 # ============================================================
-# Downloads NIFTY 50 index, midcap index, comparison ETFs, and
-# all 46 constituent stocks from Yahoo Finance. Resamples daily
-# prices to weekly Friday closes. Retries on failure and builds
-# a proxy benchmark from constituents if the index feed is down.
-
 show_section_progress(2, "Data Download")
 def download_yf_history(tickers, label, attempts=3, sleep_seconds=4, **kwargs):
     last_error = None
@@ -306,7 +311,7 @@ except Exception as e:
     BENCHMARK_SOURCE = "constituent_proxy_pending"
     print(f"   NIFTY index unavailable from Yahoo, will build proxy from constituents: {e}")
 
-# Also download NIFTY NEXT 50 as benchmark 
+# Also download NIFTY NEXT 50 as benchmark (FIX #7)
 try:
     raw_n50 = download_yf_history(
         "^NSMIDCP", "NIFTY MIDCAP benchmark",
@@ -404,15 +409,8 @@ stocks.reset_index(drop=True, inplace=True)
 print(f"   ✅ {stocks['stock'].nunique()} stocks | {len(stocks):,} rows | Failed: {failed}")
 
 # ============================================================
-# SECTION 3 — FEATURE ENGINEERING
+# 3. FEATURE ENGINEERING (no leakage — all rolling on past only)
 # ============================================================
-# Turns raw weekly prices into ~35 model features per stock:
-# returns, momentum, volatility, RSI, Bollinger %B, MACD,
-# moving average crossovers, 52-week proximity, volume ratios,
-# sector-relative momentum, cross-sectional ranks, rolling beta,
-# and idiosyncratic volatility. Also creates the binary target
-# (did this stock beat NIFTY by 35%+ over the next 12 weeks?).
-
 print("\n🔧 Engineering features ...")
 show_section_progress(3, "Feature Engineering")
 for col in ["price","volume"]:
@@ -548,7 +546,7 @@ for d in stocks["date"].unique():
 stocks["nifty_fwd_12w"] = stocks["date"].map(nifty_fwd)
 
 # ALPHA HURDLE: Require 5.0% excess return over 12 weeks to label as a winner
-ALPHA_MARGIN = 0.35 
+ALPHA_MARGIN = 0.035 
 
 stocks["target"] = np.where(
     stocks["fwd_ret_12w"].notna() & stocks["nifty_fwd_12w"].notna(),
@@ -632,14 +630,8 @@ print(f"   Target balance: "
       f"{stocks_model['target'].value_counts(normalize=True).round(3).to_dict()}")
 
 # ============================================================
-# SECTION 4 — CHRONOLOGICAL SPLIT WITH PURGE
+# 4. CHRONOLOGICAL SPLIT WITH PURGE GAP (FIX #6)
 # ============================================================
-# Splits data 70% train / 15% val / 15% test in time order.
-# Drops 8 weeks of rows on each side of every split boundary
-# to prevent rolling-window features from leaking across splits.
-# Winsorisation (clipping) bounds are computed on train only
-# and applied everywhere.
-    
 show_section_progress(4, "Chronological Split With Purge")
 all_dates = sorted(stocks_model["date"].unique())
 n_d     = len(all_dates)
@@ -716,14 +708,8 @@ ax.legend(fontsize=9)
 plt.tight_layout(); plt.show()
 
 # ============================================================
-# SECTION 5 — REGIME DETECTION ABLATION
+# 5. REGIME DETECTION — COMPOSITE SCORE ABLATION (FIX #4)
 # ============================================================
-# Finds the best number of market regimes (K) by testing K=2
-# through K=7. Scores each K on BIC, silhouette, regime
-# stability, and predictive AUC, then picks the K with the
-# highest composite score. Plots all metrics so the choice
-# is transparent.
-
 show_section_progress(5, "Regime Selection Ablation")
 print("\n🔍 Regime Detection — Composite Score Ablation ...")
 
@@ -781,7 +767,7 @@ for k in K_RANGE:
     else:
         val_auc = 0.5
 
-    # COMPOSITE SCORE (#4): weighted combination
+    # COMPOSITE SCORE (FIX #4): weighted combination
     # Normalise BIC: more negative = better → negate and normalise
     # Penalty for tiny regimes (< 3% of data)
     tiny_penalty = 1.0 if min_frac >= 0.03 else 0.5
@@ -856,15 +842,9 @@ plt.suptitle(f"Composite Ablation (BIC×0.5 + Sil×0.2 + Stab×0.2 + AUC×0.1) �
              fontsize=13, fontweight="bold")
 plt.tight_layout(); plt.show()
 
-
 # ============================================================
-# SECTION 6 — ENSEMBLE REGIME DETECTION
+# 6. ENSEMBLE REGIME DETECTION
 # ============================================================
-# Labels every week with a market regime (Bear / Sideways /
-# Bull / Breakout etc.) by combining HMM, GMM, and KMeans votes.
-# Sorts regimes by average return so label 0 = worst, K-1 = best.
-# Adds regime_id as a feature and records the current live regime.
-
 show_section_progress(6, "Ensemble Regime Detection")
 print(f"\n🔀 Ensemble Regime Detection (K={best_k}) ...")
 regime_scaler = RobustScaler().fit(X_reg_train)
@@ -1023,13 +1003,8 @@ plt.suptitle(f"Regime Detection — K={best_k} (Composite Optimal) | HMM+GMM+KMe
 plt.tight_layout(); plt.show()
 
 # ============================================================
-# SECTION 7 — SCALING
+# 7. SCALING — fit on TRAIN only
 # ============================================================
-# Fits a RobustScaler on the training set only, then transforms
-# train, val, and test. RobustScaler uses median + IQR so crash
-# week outliers don't distort the scale. Tree models don't need
-# this but the stacking meta-learner does.
-
 show_section_progress(7, "Scaling")
 scaler = RobustScaler()
 scaler.fit(tr_df[FEATURE_COLS_WITH_REGIME])
@@ -1044,17 +1019,9 @@ y_vl = vl_df["target"].astype(int).values
 y_ev = ev_df["target"].astype(int).values
 print(f"\n✅ Scaling done | Train: {len(Xs_tr):,} | Val: {len(Xs_vl):,} | Test: {len(Xs_ev):,}")
 
-
 # ============================================================
-# SECTION 8 — MODEL TRAINING
+# 10B. LEAKAGE-SAFE TRAINING OVERRIDE
 # ============================================================
-# Tunes (Optuna) and trains XGBoost, LightGBM, CatBoost,
-# RandomForest, and ExtraTrees. Builds regime-specific blended
-# models (best bagger + best booster per regime). Stacks the
-# best two diverse models with a Logistic Regression meta-learner.
-# Picks the overall best model by a composite score that rewards
-# generalisation and penalises val-test AUC gaps.
-
 show_section_progress(8, "Optimized Model Training")
 print("\n   Re-training with walk-forward tuning, internal calibration, and time-safe stacking ...")
 
@@ -1813,18 +1780,9 @@ print(f"\n   âœ… Final best global: {best_name}  Val-AUC={best_auc:.4f}")
 # Held-out test remains the final reality check for model ranking.
 print(f"   Final ranking metric: Test-AUC={metrics_g.get(best_name, {}).get('test_auc', 0.5):.4f} "
       f"| selection_score={metrics_g.get(best_name, {}).get('selection_score', best_score):.4f}")
-
-
 # ============================================================
-# SECTION 9 — CALIBRATION AND EVALUATION
+# 11. CALIBRATION DIAGNOSTIC PLOTS (FIX #1 verification)
 # ============================================================
-# Evaluates all models with AUC comparison bars, probability
-# spread check, calibration curves, ROC curves, feature
-# importance, per-regime AUC bars, confusion matrices, and
-# classification reports. Confirms models are well-calibrated
-# and not collapsed to near-50% predictions.
-
-
 show_section_progress(9, "Calibration And Evaluation")
 print("\n📊 Calibration & model evaluation plots ...")
 
@@ -1849,7 +1807,7 @@ ax.axvline(0.5, color="red", lw=1.5, ls="--", label="Random")
 ax.set_title("AUC — CV / Val / Test", fontsize=11, fontweight="bold")
 ax.legend(fontsize=8); ax.set_xlim(0.40, 0.80); ax.grid(axis="x", alpha=0.3)
 
-# 2. Probability spread 
+# 2. Probability spread (FIX #1 verification)
 ax = axes[0,1]
 spreads = [metrics_g[m].get("spread",0) for m in model_names]
 bar_cols = [C[1] if s >= MIN_SIGNAL_SPREAD else C[2] for s in spreads]
@@ -1968,17 +1926,9 @@ for rid in sorted(regime_best.keys()):
     print(classification_report(yr, m.predict(Xr),
                                  target_names=["Underperf","Outperf"], digits=3))
 
-
 # ============================================================
-# SECTION 10 — WALK-FORWARD BACKTEST
+# 12. WALK-FORWARD BACKTEST — proper benchmarks (FIX #7)
 # ============================================================
-# Simulates weekly portfolio trading on the test period.
-# Picks top-K stocks above the buy threshold, weights by
-# conviction (score²), caps positions and sectors, and deducts
-# realistic transaction costs. Compares against NIFTY, midcap,
-# and real ETF benchmarks. Reports CAGR, Sharpe, drawdown, alpha.
-
-
 show_section_progress(10, "Walk-Forward Backtest")
 print("\n🚀 Walk-Forward Backtest ...")
 
@@ -2127,7 +2077,7 @@ def build_portfolio_weights(today_df, model, feature_cols):
     X = scaler.transform(clean[feature_cols])
     probs = predict_proba_safe(model, X)
     spread = probs.max() - probs.min()
-   #1: reject degenerate signals
+    # FIX #1: reject degenerate signals
     if spread < MIN_SIGNAL_SPREAD:
         return None, None, None
     clean["score"] = probs
@@ -2351,13 +2301,8 @@ with open(experiment_path, "w", encoding="utf-8") as f:
 print(f"   Saved experiment artifact: {experiment_path}")
 
 # ============================================================
-# SECTION 11 — BACKTEST PLOTS
+# 13. BACKTEST PLOTS
 # ============================================================
-# Plots the backtest results: portfolio value curve, drawdown,
-# rolling 52-week return, year-wise return bars, outperformance
-# alpha bars, regime-wise equity curves, and a monthly alpha
-# heatmap. Gives a full picture of when and where the edge exists.
-
 show_section_progress(11, "Backtest Plots")
 print("\n📈 Generating backtest plots ...")
 
@@ -2528,14 +2473,8 @@ ax.set_title("Monthly Alpha vs NIFTY 50 (%)", fontsize=12, fontweight="bold")
 plt.tight_layout(); plt.show()
 
 # ============================================================
-# SECTION 12 — SIGNAL GENERATION
+# 14. SIGNAL GENERATION
 # ============================================================
-# Uses the live (no future data) rows to score all stocks today.
-# Classifies each as BUY / HOLD / SELL based on the tuned
-# thresholds and assigns a conviction rating. Prints the full
-# signal table and plots probability bars, signal distribution
-# donut, and sector breakdown of buys.
-
 print("\n🎯 Generating Trading Signals ...")
 
 show_section_progress(12, "Signal Generation")
@@ -2705,13 +2644,8 @@ if len(sells) > 0:
               f"Mom8W={row['mom_8w']*100:.1f}%")
 
 # ============================================================
-# SECTION 13 — MASTER DASHBOARD
+# 15. MASTER DASHBOARD
 # ============================================================
-# Single 4×4 grid figure combining the most important outputs:
-# portfolio curve, signal donut, drawdown, ablation scores,
-# year-wise returns, feature importance, and a performance
-# summary table for all strategies side by side.
-
 print("\n🖥️  Master Dashboard ...")
 show_section_progress(13, "Master Dashboard")
 fig = plt.figure(figsize=(26, 24))
@@ -2791,13 +2725,8 @@ plt.suptitle(
 plt.show()
 
 # ============================================================
-# SECTION 14 — FINAL SUMMARY
+# 16. FINAL SUMMARY
 # ============================================================
-# Prints a clean text summary of the full run: config, CAGR
-# vs all benchmarks, Sharpe, max drawdown, win-rate, invested
-# vs cash weeks, current regime, top buy picks, and a disclaimer
-# that this is research only, not financial advice.
-
 show_section_progress(14, "Final Summary")
 print("\n" + "="*78)
 print("   ✅  NIFTY 50 ADAPTIVE FACTOR-REGIME ML v8.0 — COMPLETE")
