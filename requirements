@@ -1,0 +1,13 @@
+numpy
+pandas
+yfinance
+matplotlib
+seaborn
+scipy
+scikit-learn
+optuna
+xgboost
+lightgbm
+catboost
+hmmlearn
+
